@@ -3829,7 +3829,13 @@ class UnrealInlineShadersWinTest(unittest.TestCase):
                 env.pop('DM_OODLE_MODULES', None)
                 env['DM_GAME'] = '0100A3501946E000'
                 probe = (
-                    'import os, runpy, struct, sys, zlib\n'
+                    'import os, runpy, struct, sys, types, zlib\n'
+                    'try:\n'
+                    '    import lz4.block\n'
+                    'except ModuleNotFoundError:\n'
+                    '    _m = types.ModuleType("lz4"); _b = types.ModuleType("lz4.block")\n'
+                    '    _b.decompress = lambda *a, **kw: b""; _m.block = _b\n'
+                    '    sys.modules["lz4"] = _m; sys.modules["lz4.block"] = _b\n'
                     f'repo = {str(self.repo)!r}\n'
                     'sys.path.insert(0, os.path.join(repo, "dm/gfx/tools"))\n'
                     'import uepak\n'
@@ -3890,7 +3896,19 @@ class LoveAndOodleEmuWinTest(unittest.TestCase):
     @staticmethod
     def _make_nso0(img: bytes | bytearray, compress: bool = True) -> bytes:
         import struct
-        import lz4.block
+        import types
+        import zlib
+        try:
+            import lz4.block
+        except ModuleNotFoundError:
+            _m = types.ModuleType('lz4')
+            _b = types.ModuleType('lz4.block')
+            _b.compress = lambda raw, **_kw: zlib.compress(raw)
+            _b.decompress = lambda blob, **_kw: zlib.decompress(blob)
+            _m.block = _b
+            sys.modules['lz4'] = _m
+            sys.modules['lz4.block'] = _b
+            lz4 = _m
         img_b = bytes(img)
         assert len(img_b) >= 0x3000
         segs = [(0x0000, 0x1000), (0x1000, 0x1000), (0x2000, len(img_b) - 0x2000)]
@@ -3986,11 +4004,20 @@ class LoveAndOodleEmuWinTest(unittest.TestCase):
                 )
 
     def test_arm64_fast_stubs_disassemble_cleanly_and_cover_hot_imports(self) -> None:
-        from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
+        import struct
         E = self.arm64_emu
-        cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
-        insns = list(cs.disasm(E.FAST_STUB_BYTES, E.FAST_BASE))
-        self.assertGreater(len(insns), 60)
+        self.assertEqual(len(E.FAST_STUB_BYTES) % 4, 0)
+        words = [w for (w,) in struct.iter_unpack('<I', E.FAST_STUB_BYTES)]
+        self.assertGreater(len(words), 60)
+        self.assertIn(0xD65F03C0, words)  # ARM64 `ret`
+        try:
+            from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
+        except ModuleNotFoundError:
+            Cs = None
+        if Cs is not None:
+            cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+            insns = list(cs.disasm(E.FAST_STUB_BYTES, E.FAST_BASE))
+            self.assertEqual(len(insns), len(words), 'every 4-byte word must disassemble as a valid ARM64 instruction')
         # Every fast stub address must be 16-byte aligned and within [FAST_BASE, FAST_BASE + len)
         for sym, addr in E.FAST_STUB_ADDRS.items():
             self.assertEqual(addr % 16, 0, f'{sym} at {addr:#x} is not 16-byte aligned')

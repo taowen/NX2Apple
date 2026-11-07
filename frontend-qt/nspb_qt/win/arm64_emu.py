@@ -396,8 +396,6 @@ FAST_STUB_BYTES, FAST_STUB_ADDRS = _build_fast_stubs()
 
 def nso_load(path: str | Path) -> tuple[bytearray, int, int, int]:
     """Decompress an NSO0 file into `(image_with_bss, text_end, ro_off, data_off)`."""
-    import lz4.block
-
     d = Path(path).read_bytes()
     if len(d) < 0x6C or d[:4] != b'NSO0':
         raise EmuError(f'{path}: not an NSO')
@@ -414,6 +412,7 @@ def nso_load(path: str | Path) -> tuple[bytearray, int, int, int]:
             raise EmuError(f'{path}: truncated NSO segment {i}')
         raw = d[fo:fo + csz[i]]
         if (flags >> i) & 1:
+            import lz4.block
             raw = lz4.block.decompress(raw, uncompressed_size=sz)
         img[mo:mo + sz] = raw
     return img, segs[0][1] + segs[0][2], segs[1][1], segs[2][1]

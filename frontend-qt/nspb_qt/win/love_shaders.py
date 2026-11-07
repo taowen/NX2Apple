@@ -60,7 +60,6 @@ def nso_image(path: str | Path) -> bytes:
     d = Path(path).read_bytes()
     if len(d) < 0x6C or d[:4] != b'NSO0':
         return d
-    import lz4.block
 
     flags = struct.unpack_from('<I', d, 0x0C)[0]
     segs = [struct.unpack_from('<III', d, 0x10 + i * 0x10) for i in range(3)]
@@ -74,6 +73,7 @@ def nso_image(path: str | Path) -> bytes:
             raise ValueError(f'{path}: truncated NSO segment {i}')
         raw = d[fo:fo + csz[i]]
         if (flags >> i) & 1:
+            import lz4.block
             raw = lz4.block.decompress(raw, uncompressed_size=sz)
         img[mo:mo + sz] = raw
     return bytes(img)
