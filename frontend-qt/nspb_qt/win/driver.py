@@ -19,10 +19,11 @@ What gets replaced, and why:
 `can_clone`               no APFS: plain copies (`nx_extract` spends the disk, not the build)
 `apple_silicon`           no `sysctl`
 `heap_check`              boots the game in the Mac host; replaced by an estimate
-`build_mac_host`          the Mac host can never run here: refuses with a clear message
+`build_mac_host`          points decoder tool-mode steps (`DM_OODLE_SERVE` / `DM_OODLE_JOB`) at
+                          `oodle_emu.py` (native x64 Oodle DLL passthrough or emulated ARM64)
 `toolchain`               the shader cache key needs the Windows Metal compiler's version
-`capture_shaders` /       run-time shader capture boots the game in the Mac host: refused,
-`capture_glslc`           with the device-capture workflow explained
+`capture_shaders`         reconstructs LÖVE OpenGL shaders offline via `love_shaders.py`; other
+                          run-time shader captures explain the device-capture workflow
 `mac_app` / `mac_run`     Mac platforms: refused
 `build_ipa.sh`            replaced by `build_app.py` (through the shim, which also has to cover
                           the child processes the pipeline starts)
@@ -251,7 +252,11 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
     mod.ALLOW_OTHER_METAL = True                  # Windows Metal Tools version differs from Xcode's
 
     # ---------------------------------------------------------------- the Mac host
+    _in_oodle_host_lookup = False
+
     def build_mac_host(repo_, out, env, logs, g, *a, **kw):
+        if _in_oodle_host_lookup:
+            return Path(__file__).resolve().parent / 'oodle_emu.py'
         raise BuildError(
             'this step boots the game\'s own arm64 code in a Mac host, which no Windows PC can '
             'run. It is needed only for a game whose shaders appear at run time (GLSLC / Vulkan / '
@@ -259,6 +264,27 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
             'are in the RomFS (Mario Wonder, Odyssey, Mario Kart 8 Deluxe, the Zelda games, …) '
             'do not need it.')
     mod.build_mac_host = build_mac_host
+    if hasattr(mod, 'UE_DECODE_SECS') and isinstance(mod.UE_DECODE_SECS, (int, float)):
+        mod.UE_DECODE_SECS = max(int(mod.UE_DECODE_SECS) * 20, 3600)
+
+    if not hasattr(mod, '_nspb_orig_decode_ue_shaders') and hasattr(mod, 'decode_ue_shaders'):
+        mod._nspb_orig_decode_ue_shaders = mod.decode_ue_shaders
+
+    if hasattr(mod, '_nspb_orig_decode_ue_shaders'):
+        _orig_decode_ue_shaders = mod._nspb_orig_decode_ue_shaders
+
+        def decode_ue_shaders(repo_, dirs, pkg_ver, patched, work, env, logs, g, *a, **kw):
+            nonlocal _in_oodle_host_lookup
+            prev = _in_oodle_host_lookup
+            _in_oodle_host_lookup = True
+            try:
+                return _orig_decode_ue_shaders(
+                    repo_, dirs, pkg_ver, patched, work, env, logs, g, *a, **kw
+                )
+            finally:
+                _in_oodle_host_lookup = prev
+
+        mod.decode_ue_shaders = decode_ue_shaders
 
     def heap_check(repo_, d, patched, work, env, logs, g, *a, **kw):
         """The heap check without the Mac host.
@@ -428,7 +454,43 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
                 'build from the same work folder (its shader/ and extract/ are reused).')
         return fn
     mod.capture_glslc = _refuse_capture('this game')
-    mod.capture_shaders = _refuse_capture('this game')
+
+    def capture_shaders(repo_, d, patched, work, env, logs, g, api='gl', *a, **kw):
+        """Reconstruct LÖVE OpenGL shaders offline via `love_shaders.py`, or refuse other captures."""
+        if api == 'gl' and d is not None:
+            d_path = Path(d)
+            out = d_path / 'gl_capture'
+            want = mod.capture_wanted(g, 'gl') if (g is not None and hasattr(mod, 'capture_wanted')) else None
+            if want and hasattr(mod, 'capture_done') and mod.capture_done(out, 'gl') >= want:
+                mod.PROG.stage('GL shader capture')
+                say(f'reusing the captured run-time shaders: {out}')
+                mod.PROG.end('reused')
+                return out
+            main_nso = d_path / 'ExeFS' / 'main'
+            if main_nso.is_file():
+                from . import love_shaders
+                part = d_path / 'gl_capture.partial'
+                mod.rmtree(part)
+                table = None
+                if g is not None and hasattr(mod, 'CAPTURES'):
+                    try:
+                        table = g.table(mod.CAPTURES['gl']['table'])
+                    except Exception:
+                        table = None
+                rom_src = mod.rfs.source(d_path) if hasattr(mod, 'rfs') else (d_path / 'RomFS')
+                res = love_shaders.generate(main_nso, rom_src, part, table, log=say, repo=repo_)
+                if res is not None:
+                    mod.PROG.stage('GL shader reconstruction (LÖVE)')
+                    if hasattr(mod, 'swap_in'):
+                        mod.swap_in(part, out)
+                    else:
+                        mod.rmtree(out)
+                        part.rename(out)
+                    mod.PROG.end(f'{len(res[0])} shaders')
+                    return out
+        return _refuse_capture('this game')(repo_, d, patched, work, env, logs, g, api, *a, **kw)
+
+    mod.capture_shaders = capture_shaders
 
     def capture_jit(py_, repo_, d, patched, work, env, logs, g, *a, **kw):
         if (Path(d) / 'jit' / 'jit.img').is_file():
@@ -437,7 +499,7 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
         _refuse_capture('this game (nn::jit)')()
     mod.capture_jit = capture_jit
 
-    # ---------------------------------------------------------------- Unreal inline shaders
+    # ---------------------------------------------------------------- Unreal inline & Oodle/LZ5 shaders
     if not hasattr(mod, '_nspb_orig_split_shaders') and hasattr(mod, 'split_shaders'):
         mod._nspb_orig_split_shaders = mod.split_shaders
 
@@ -446,18 +508,13 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
 
         def split_shaders(py_, repo_, roms, mains, pkg, env, logs, g,
                           provisional=False, oodle=None, *a, **kw):
-            """Defer the Mac-host Oodle requirement for Unreal inline-shader paks (`ue_legacy`).
+            """Wire `oodle_emu.py` for Oodle/LZ5 games while keeping pure Zlib/LZ4 paks zero-overhead.
 
-            Upstream passes an `oodle` callback whenever `oodle_packs` or `ue_legacy` is non-empty,
-            and `split_shaders` invokes `oodle()` before running `shader_split.py`. Non-Unreal
-            Oodle archives (`oodle_packs`) have already been verified to contain Oodle streams, so
-            they keep `oodle` and stop immediately. Unreal inline-shader paks (`ue_legacy`, such as
-            OCTOPATH TRAVELER I & II or Yoshi's Crafted World) frequently store their pak blocks
-            and inline `LSLG` shaders with Zlib, LZ4, or no compression, which `shader_split.py`
-            decodes in Python without a Mac host. Run `shader_split.py` with `oodle=None`; if a
-            package actually needs the Mac-host Oodle/LZ5 decoder, `run_ipa` catches the
-            `DM_OODLE_HOST` diagnostic in `shader_split.log` and raises `BuildError` before any
-            tables or cache keys are written.
+            When `oodle_packs` is empty and the game's `ExeFS/main` embeds no Oodle or LZ5 decoder
+            (e.g., OCTOPATH TRAVELER I or Yoshi's Crafted World), `oodle` is cleared to `None` so
+            `shader_split.py` runs purely in Python with zero child-process overhead. When the game
+            does have Oodle packs or an embedded Oodle/LZ5 decoder, `oodle` resolves `DM_OODLE_HOST`
+            to `oodle_emu.py`.
             """
             if oodle is not None:
                 pg = getattr(mod, 'pg', None)
@@ -473,11 +530,25 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
                 has_oodle_packs = pg is not None and any(
                     pg.oodle_packs(r)[0] for r in roms
                 )
-                if not has_oodle_packs:
+                from . import oodle_emu
+                if not has_oodle_packs and not oodle_emu.has_decoder(mains):
                     oodle = None
                     if env.get('DM_EXPERIMENTAL_BUILDER') == '1':
                         env = dict(env)
                         env.pop('DM_EXPERIMENTAL_BUILDER', None)
+                else:
+                    _orig_oodle = oodle
+
+                    def _win_oodle():
+                        nonlocal _in_oodle_host_lookup
+                        prev = _in_oodle_host_lookup
+                        _in_oodle_host_lookup = True
+                        try:
+                            return _orig_oodle()
+                        finally:
+                            _in_oodle_host_lookup = prev
+
+                    oodle = _win_oodle
             return _orig_split_shaders(py_, repo_, roms, mains, pkg, env, logs, g,
                                        provisional, oodle, *a, **kw)
 

@@ -1762,7 +1762,8 @@ class PlatformIsolationTest(unittest.TestCase):
             code = (
                 'import sys; sys.path.insert(0, %r)\n'
                 'from nspb_qt.win import toolchain, sdk_fetch, shim, fix_ipa_modes, fetch, '
-                'doctor, build_app, driver, xcrun_shim, macho_sign, sdk_auto_cuts\n'
+                'doctor, build_app, driver, xcrun_shim, macho_sign, sdk_auto_cuts, '
+                'love_shaders, arm64_emu, oodle_emu\n'
                 'print("ok")\n'
             ) % str(QT)
             r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
@@ -3758,15 +3759,17 @@ class UnrealInlineShadersWinTest(unittest.TestCase):
             self.assertIsNone(recorded[-1][0])
             self.assertNotIn('DM_EXPERIMENTAL_BUILDER', recorded[-1][1])
 
-            # 2) Non-Unreal Oodle archive game (oodle_packs non-empty): keeps oodle and fails fast.
+            # 2) Non-Unreal Oodle archive game (oodle_packs non-empty): keeps oodle and resolves
+            #    build_mac_host to oodle_emu.py inside the oodle callback context.
             FakePG.oodle_packs = staticmethod(lambda _r: ([Path('arc/data.trpfs')], 'Trinity'))
-            with self.assertRaises(self.mod.BuildError) as ctx:
-                self.mod.split_shaders(
-                    Path(sys.executable), self.repo, [Path('romfs')], [Path('main')],
-                    Path('pkg'), {}, Path('logs'), None,
-                    provisional=False, oodle=boom_oodle)
+            res2 = self.mod.split_shaders(
+                Path(sys.executable), self.repo, [Path('romfs')], [Path('main')],
+                Path('pkg'), {}, Path('logs'), None,
+                provisional=False, oodle=boom_oodle)
+            self.assertEqual(res2, 'pkg-key')
             self.assertTrue(called)
-            self.assertIn('arm64', str(ctx.exception))
+            self.assertIsNotNone(recorded[-1][0])
+            self.assertTrue(recorded[-1][0]()['DM_OODLE_HOST'].endswith('oodle_emu.py'))
         finally:
             self.mod._nspb_orig_split_shaders = orig_under
             if had_pg:
@@ -3867,6 +3870,432 @@ class UnrealInlineShadersWinTest(unittest.TestCase):
                     os.environ.pop('LOCALAPPDATA', None)
                 else:
                     os.environ['LOCALAPPDATA'] = old_local
+
+
+class LoveAndOodleEmuWinTest(unittest.TestCase):
+    """Tests for offline LÖVE GLSL shader reconstruction (`love_shaders.py`) and the optimized
+    Oodle / LZ5 decoder host (`arm64_emu.py` + `oodle_emu.py`)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from nspb_qt.win import arm64_emu, driver as _drv, love_shaders, oodle_emu
+        cls.driver = _drv
+        cls.love_shaders = love_shaders
+        cls.arm64_emu = arm64_emu
+        cls.oodle_emu = oodle_emu
+        cls.repo = QT.parent / 'engine'
+        cls.mod = _drv.load_upstream(cls.repo)
+        _drv.patch(cls.mod, cls.repo)
+
+    @staticmethod
+    def _make_nso0(img: bytes | bytearray, compress: bool = True) -> bytes:
+        import struct
+        import lz4.block
+        img_b = bytes(img)
+        assert len(img_b) >= 0x3000
+        segs = [(0x0000, 0x1000), (0x1000, 0x1000), (0x2000, len(img_b) - 0x2000)]
+        hdr = bytearray(0x100)
+        hdr[:4] = b'NSO0'
+        struct.pack_into('<I', hdr, 0x0C, 0b111 if compress else 0)
+        body = bytearray()
+        fo = 0x100
+        for i, (mo, sz) in enumerate(segs):
+            raw = img_b[mo:mo + sz]
+            blob = lz4.block.compress(raw, store_size=False) if compress else raw
+            struct.pack_into('<III', hdr, 0x10 + i * 0x10, fo, mo, sz)
+            struct.pack_into('<I', hdr, 0x60 + i * 4, len(blob))
+            body.extend(blob)
+            fo += len(blob)
+        return bytes(hdr + body)
+
+    def test_love_shaders_offline_reconstruction_and_driver_capture_shaders(self) -> None:
+        lua_src = (
+            'local GLSL = {}\n'
+            'GLSL.VERSION = {\n'
+            '    glsl1 = { [false] = "#version 120", [true] = "#version 100" },\n'
+            '    glsl3 = { [false] = "#version 330 core", [true] = "#version 300 es" },\n'
+            '}\n'
+            'GLSL.SYNTAX = [==[\n#define number float\n]==]\n'
+            'GLSL.UNIFORMS = [==[\nuniform mat4 TransformProjectionMatrix;\n]==]\n'
+            'GLSL.FUNCTIONS = [==[\nvec4 gammaCorrectColor(vec4 c) { return c; }\n]==]\n'
+            'GLSL.VERTEX = {\n'
+            '    HEADER = [==[\n#define LOVE_VERTEX_HEADER 1\n]==],\n'
+            '    FUNCTIONS = [==[\nvoid love_vfn() {}\n]==],\n'
+            '    MAIN = [==[\nvoid main() { gl_Position = position(TransformProjectionMatrix, vec4(0.0)); }\n]==],\n'
+            '}\n'
+            'GLSL.PIXEL = {\n'
+            '    HEADER = [==[\n#define LOVE_PIXEL_HEADER 1\n]==],\n'
+            '    FUNCTIONS = [==[\nvoid love_pfn() {}\n]==],\n'
+            '    MAIN = [==[\nvoid main() { love_PixelColor = effect(vec4(1.0), MainTex, VaryingTexCoord.xy, gl_FragCoord.xy); }\n]==],\n'
+            '    MAIN_CUSTOM = [==[\nvoid main() { effect(); }\n]==],\n'
+            '}\n'
+            'local defaultcode = {\n'
+            '    vertex = [==[\nvec4 position(mat4 m, vec4 p) { return m * p; }\n]==],\n'
+            '    pixel = [==[\nvec4 effect(vec4 c, Image t, vec2 tc, vec2 pc) { return c; }\n]==],\n'
+            '    videopixel = [==[\nvoid effect() { /* video */ }\n]==],\n'
+            '    arraypixel = [==[\nvoid effect() { /* array */ }\n]==],\n'
+            '}\n'
+            'function love.graphics._shaderCodeToGLSL(gles, arg1, arg2)\nend\n'
+        )
+        img = bytearray(0x3000)
+        lua_bytes = b'\x00' + lua_src.encode('utf-8') + b'\x00'
+        img[0x1100:0x1100 + len(lua_bytes)] = lua_bytes
+
+        with tempfile.TemporaryDirectory() as td:
+            game_dir = Path(td) / 'extract' / 'v0'
+            (game_dir / 'ExeFS').mkdir(parents=True)
+            (game_dir / 'ExeFS' / 'main').write_bytes(self._make_nso0(img, compress=True))
+
+            romfs = game_dir / 'RomFS'
+            (romfs / 'resources' / 'shaders').mkdir(parents=True)
+            (romfs / 'conf.lua').write_text('function love.conf(t) t.gammacorrect = false end\n', encoding='utf-8')
+            (romfs / 'resources' / 'shaders' / 'CRT.fs').write_bytes(
+                b'vec4 effect(vec4 c, Image t, vec2 tc, vec2 pc) {\r\n    return c * 0.5;\r\n}\r\n'
+            )
+            (romfs / 'resources' / 'shaders' / ' Vortex.fs').write_bytes(
+                b'vec4 position(mat4 m, vec4 p) { return m * p; }\n'
+                b'void effect() { love_Canvases[0] = vec4(1.0); }\n'
+            )
+
+            out_cap = self.mod.capture_shaders(
+                self.repo, game_dir, Path(td) / 'patched', Path(td), {}, Path(td), None, 'gl'
+            )
+            self.assertEqual(out_cap, game_dir / 'gl_capture')
+            files = sorted(p.name for p in out_cap.iterdir() if p.is_file())
+            # 4 built-in defaults + 1 CRT.fs (.frag) + 2 Vortex.fs (.vert and .frag) = 7 shaders
+            self.assertEqual(len(files), 7, f'unexpected shader files: {files}')
+
+            # Verify table validation matches 100% byte-for-byte
+            tbl = Path(td) / 'gl_capture.tsv'
+            tbl.write_text('\n'.join(files) + '\n', encoding='utf-8')
+            out2 = Path(td) / 'verify_cap'
+            logs: list[str] = []
+            res = self.love_shaders.generate(
+                game_dir / 'ExeFS' / 'main', romfs, out2, table=tbl, log=logs.append, repo=self.repo
+            )
+            self.assertIsNotNone(res)
+            made, want = res
+            self.assertEqual(set(made), want)
+            self.assertTrue(any('every one, byte for byte' in ln for ln in logs), logs)
+
+            # Non-LÖVE binary falls back to BuildError
+            (game_dir / 'ExeFS' / 'main').write_bytes(self._make_nso0(bytearray(0x3000), compress=False))
+            with self.assertRaises(self.mod.BuildError):
+                self.mod.capture_shaders(
+                    self.repo, game_dir, Path(td) / 'patched', Path(td), {}, Path(td), None, 'gl'
+                )
+
+    def test_arm64_fast_stubs_disassemble_cleanly_and_cover_hot_imports(self) -> None:
+        from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
+        E = self.arm64_emu
+        cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+        insns = list(cs.disasm(E.FAST_STUB_BYTES, E.FAST_BASE))
+        self.assertGreater(len(insns), 60)
+        # Every fast stub address must be 16-byte aligned and within [FAST_BASE, FAST_BASE + len)
+        for sym, addr in E.FAST_STUB_ADDRS.items():
+            self.assertEqual(addr % 16, 0, f'{sym} at {addr:#x} is not 16-byte aligned')
+            self.assertGreaterEqual(addr, E.FAST_BASE)
+            self.assertLess(addr, E.FAST_BASE + len(E.FAST_STUB_BYTES))
+        for must_have in ('memcpy', 'memmove', 'memset', 'memcmp', 'strlen', 'strcmp', 'strncmp',
+                          'malloc', 'calloc', 'free', '_Znwm', '_ZdlPv', '__errno'):
+            self.assertIn(must_have, E.FAST_STUB_ADDRS)
+
+    def test_oodle_emu_decoder_discovery_disk_cache_and_protocols(self) -> None:
+        import struct
+        from unittest import mock
+        E = self.arm64_emu
+        OE = self.oodle_emu
+
+        # Build a synthetic NSO with MOD0, .eh_frame_hdr, and ADRP+ADD referencing "OodleLZ_Decompress\0"
+        img = bytearray(0x4000)
+        struct.pack_into('<I', img, 4, 0x1000)
+        # ADRP x16, #0x1000 (+1 page = 0xb0000010); ADD x16, x16, #0x600 (0x91180210); RET
+        struct.pack_into('<III', img, 0x40, 0xB0000010, 0x91180210, 0xD65F03C0)
+        img[0x1000:0x1004] = b'MOD0'
+        struct.pack_into('<i', img, 0x1004, 0x40)   # dynamic at 0x1040
+        struct.pack_into('<i', img, 0x1010, 0x700)  # .eh_frame_hdr at 0x1700
+        s_oodle = b'OodleLZ_Decompress\0'
+        img[0x1600:0x1600 + len(s_oodle)] = s_oodle
+        struct.pack_into('<BBBBIIII', img, 0x1700, 1, 0x03, 0x03, 0x03, 0, 1, 0x40, 0)
+
+        symtab_off, strtab_off, rela_off = 0x1100, 0x1300, 0x1500
+        strs = bytearray(b'\0malloc\0free\0memcpy\0')
+        syms = bytearray(24)
+        syms.extend(struct.pack('<IBBHQQ', 1, 0x10, 0, 0, 0, 0))
+        relas = struct.pack('<QQq', 0x2000, (1 << 32) | 1025, 0)
+        img[symtab_off:symtab_off + len(syms)] = syms
+        img[strtab_off:strtab_off + len(strs)] = strs
+        img[rela_off:rela_off + len(relas)] = relas
+        for i, (t, v) in enumerate([(6, symtab_off), (5, strtab_off), (7, rela_off), (8, len(relas)), (0, 0)]):
+            struct.pack_into('<qQ', img, 0x1040 + i * 16, t, v)
+
+        # Lightweight stand-in Uc so the full Machine + Decoder + cache + serve/job pipeline runs
+        # deterministically even on CI runners without the native `unicorn` wheel installed.
+        class StandInUc:
+            def __init__(self, _arch: int, _mode: int) -> None:
+                self.mem: dict[int, bytearray] = {}
+                self.regs: dict[int, int] = {}
+
+            def mem_map(self, addr: int, size: int, _prot: int = 7) -> None:
+                self.mem[addr] = bytearray(size)
+
+            def _find_seg(self, addr: int) -> tuple[int, bytearray]:
+                for base, buf in self.mem.items():
+                    if base <= addr < base + len(buf):
+                        return base, buf
+                raise RuntimeError(f'unmapped {addr:#x}')
+
+            def mem_write(self, addr: int, data: bytes) -> None:
+                base, buf = self._find_seg(addr)
+                off = addr - base
+                buf[off:off + len(data)] = data
+
+            def mem_read(self, addr: int, size: int) -> bytearray:
+                base, buf = self._find_seg(addr)
+                off = addr - base
+                return bytearray(buf[off:off + size])
+
+            def reg_write(self, reg: int, val: int) -> None:
+                self.regs[reg] = val & 0xFFFFFFFFFFFFFFFF
+
+            def reg_read(self, reg: int) -> int:
+                return self.regs.get(reg, 0)
+
+            def hook_add(self, *_a, **_kw) -> int:
+                return 1
+
+            def emu_start(self, _begin: int, _until: int, **_kw) -> None:
+                # OodleLZ_Decompress(comp=x0, cl=x1, raw=x2, rl=x3): copy XOR-0xAA decoded bytes
+                c = self.reg_read(E.UC_ARM64_REG_X0)
+                cl = self.reg_read(E.UC_ARM64_REG_X0 + 1)
+                r = self.reg_read(E.UC_ARM64_REG_X0 + 2)
+                rl = self.reg_read(E.UC_ARM64_REG_X0 + 3)
+                comp_data = bytes(self.mem_read(c, cl))
+                if cl == rl and comp_data.startswith(b'OK'):
+                    self.mem_write(r, bytes(b ^ 0xAA for b in comp_data))
+                    self.reg_write(E.UC_ARM64_REG_X0, rl)
+                else:
+                    self.reg_write(E.UC_ARM64_REG_X0, 0)
+
+        with tempfile.TemporaryDirectory() as td:
+            exefs = Path(td) / 'extract' / 'v0' / 'ExeFS'
+            exefs.mkdir(parents=True)
+            (exefs / 'main').write_bytes(self._make_nso0(img, compress=True))
+            patched = Path(td) / 'patched_v0'
+            patched.mkdir()
+
+            self.assertTrue(OE.has_decoder(exefs))
+            self.assertFalse(OE.has_decoder(patched))
+
+            with mock.patch.object(E, '_HAS_UNICORN', True), mock.patch.object(E, 'Uc', StandInUc):
+                # 1) Cold Decoder init writes relocation snapshot to disk cache
+                dec1 = OE.Decoder(patched)
+                self.assertEqual(dec1.kind, 'OodleLZ_Decompress')
+                self.assertEqual(dec1.off, 0x40)
+                cache_f = OE._cache_file_for([('main', str(exefs / 'main'))])
+                self.assertIsNotNone(cache_f)
+                self.assertTrue(cache_f.is_file(), 'disk pre-relocation cache must be written')
+
+                # 2) Warm Decoder init loads directly from the disk cache
+                dec2 = OE.Decoder(patched)
+                self.assertEqual(dec2.kind, 'OodleLZ_Decompress')
+                raw = dec2.run(b'OK_PAYLOAD_12345', 16)
+                self.assertEqual(raw, bytes(b ^ 0xAA for b in b'OK_PAYLOAD_12345'))
+                self.assertIsNone(dec2.run(b'BAD_DATA', 16))
+
+                # 3) DM_OODLE_JOB end-to-end
+                job_path = Path(td) / 'oodle.job'
+                rec1 = b'OK_SHADER_000001'
+                rec2 = b'OK_SHADER_000002'
+                with open(job_path, 'wb') as jf:
+                    jf.write(struct.pack('<II', 0x4A4F4D44, 2))
+                    for rec in (rec1, rec2):
+                        jf.write(struct.pack('<II', len(rec), len(rec)) + rec)
+                rc = OE.job(dec2, str(job_path))
+                self.assertEqual(rc, 0)
+                out_data = Path(str(job_path) + '.out').read_bytes()
+                magic, cnt = struct.unpack_from('<II', out_data, 0)
+                self.assertEqual(magic, 0x524F4D44)
+                self.assertEqual(cnt, 2)
+
+            # 4) Verify shim maps oodle_emu.py / nspb_oodle_host to [py_exe, _OODLE_EMU]
+            old_local = os.environ.get('LOCALAPPDATA')
+            os.environ['LOCALAPPDATA'] = td
+            try:
+                env = shim.build_env(python_exe=sys.executable)
+                sd = shim.shim_dir()
+                sc = (sd / 'sitecustomize.py').read_text(encoding='utf-8').replace(
+                    "if os.name == 'nt'", "if True", 1
+                )
+                (sd / 'sitecustomize.py').write_text(sc, encoding='utf-8')
+                r = subprocess.run(
+                    [
+                        sys.executable,
+                        '-c',
+                        'import sitecustomize as s; m = s._map(["/path/to/oodle_emu.py", "patched_v0"]); '
+                        'assert m[1].endswith("oodle_emu.py") and m[2] == "patched_v0", m; print("MAPPED_OK")',
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn('MAPPED_OK', r.stdout)
+            finally:
+                if old_local is None:
+                    os.environ.pop('LOCALAPPDATA', None)
+                else:
+                    os.environ['LOCALAPPDATA'] = old_local
+
+    def test_native_dll_passthrough_serve_protocol_and_real_unicorn_fast_stubs(self) -> None:
+        import io
+        import struct
+        from unittest import mock
+        E = self.arm64_emu
+        OE = self.oodle_emu
+
+        # 1) Driver context guard: direct build_mac_host raises BuildError, while inside the Oodle
+        #    lookup context it returns the existing oodle_emu.py path.
+        with self.assertRaises(self.mod.BuildError):
+            self.mod.build_mac_host(self.repo, Path('.'), {}, Path('.'), None)
+
+        # 2) NativeOodleDll passthrough & fallback + DM_OODLE_SERVE binary stream protocol
+        img = bytearray(0x4000)
+        struct.pack_into('<I', img, 4, 0x1000)
+        struct.pack_into('<III', img, 0x40, 0xB0000010, 0x91180210, 0xD65F03C0)
+        img[0x1000:0x1004] = b'MOD0'
+        struct.pack_into('<i', img, 0x1004, 0x40)
+        struct.pack_into('<i', img, 0x1010, 0x700)
+        s_oodle = b'OodleLZ_Decompress\0'
+        img[0x1600:0x1600 + len(s_oodle)] = s_oodle
+        struct.pack_into('<BBBBIIII', img, 0x1700, 1, 0x03, 0x03, 0x03, 0, 1, 0x40, 0)
+        for i, (t, v) in enumerate([(6, 0x1100), (5, 0x1300), (7, 0x1500), (8, 0), (0, 0)]):
+            struct.pack_into('<qQ', img, 0x1040 + i * 16, t, v)
+
+        class FakeNativeDll:
+            path = Path('/fake/oo2core_9_win64.dll')
+
+            def decompress(self, comp: bytes, rl: int) -> bytes | None:
+                if comp.startswith(b'DLL_OK'):
+                    return b'N' * rl
+                return None
+
+        with tempfile.TemporaryDirectory() as td:
+            exefs = Path(td) / 'extract' / 'v0' / 'ExeFS'
+            exefs.mkdir(parents=True)
+            (exefs / 'main').write_bytes(self._make_nso0(img, compress=True))
+            patched = Path(td) / 'patched_v0'
+            patched.mkdir()
+
+            with mock.patch.object(OE, 'find_native_oodle_dll', return_value=FakeNativeDll.path), \
+                    mock.patch.object(OE, 'NativeOodleDll', return_value=FakeNativeDll()):
+                dec = OE.Decoder(patched)
+                # Unicorn VM is NOT even initialized when native DLL is present for Oodle!
+                self.assertIsNone(dec.m)
+                self.assertTrue(dec.using_native_dll)
+                self.assertEqual(dec.run(b'DLL_OK_DATA', 12), b'N' * 12)
+
+                # Test DM_OODLE_SERVE binary stream protocol over stdin/stdout buffers
+                req_stream = io.BytesIO(
+                    struct.pack('<QQ', 11, 8) + b'DLL_OK_1234' + struct.pack('<QQ', 0, 0)
+                )
+                resp_stream = io.BytesIO()
+                fake_in = mock.MagicMock(buffer=req_stream)
+                fake_out = mock.MagicMock(buffer=resp_stream)
+                with mock.patch.object(sys, 'stdin', fake_in), mock.patch.object(sys, 'stdout', fake_out):
+                    rc = OE.serve(dec)
+                self.assertEqual(rc, 0)
+                resp_bytes = resp_stream.getvalue()
+                self.assertEqual(resp_bytes, struct.pack('<Q', 8) + (b'N' * 8) + struct.pack('<Q', 0))
+
+            # 3) If real Unicorn is installed, verify the in-VM ARM64 fast stubs execute with 0 traps
+            if E._HAS_UNICORN and E.Uc is not None:
+                # Build an ARM64 function at +0x80 that calls malloc(64), memset(p, 0x5A, 64),
+                # memcpy(dst, p, rl), free(p), and returns rl in x0 — all via FAST_STUB_ADDRS!
+                code_words = [
+                    0xA9BD7BFD,  # stp x29, x30, [sp, #-48]!
+                    0xA90153F3,  # stp x19, x20, [sp, #16]
+                    0xA9025BF5,  # stp x21, x22, [sp, #32]
+                    0xAA0003F3,  # mov x19, x0 (comp)
+                    0xAA0203F4,  # mov x20, x2 (raw)
+                    0xAA0303F5,  # mov x21, x3 (rl)
+                    # Call malloc(x21) via GOT slot at +0x2000
+                    0xAA1503E0,  # mov x0, x21
+                    0xD0000010,  # adrp x16, #0x2000 (from page 0x0000 -> +2 pages = 0xD0000010)
+                    0xF9400210,  # ldr x16, [x16, #0] (GOT[0] = malloc)
+                    0xD63F0200,  # blr x16
+                    0xAA0003F6,  # mov x22, x0 (tmp buf)
+                    # Call memcpy(x22, x19, x21) via GOT[1] at +0x2008
+                    0xAA1603E0,  # mov x0, x22
+                    0xAA1303E1,  # mov x1, x19
+                    0xAA1503E2,  # mov x2, x21
+                    0xD0000010,  # adrp x16, #0x2000
+                    0xF9400610,  # ldr x16, [x16, #8] (GOT[1] = memcpy)
+                    0xD63F0200,  # blr x16
+                    # Call memcpy(x20, x22, x21)
+                    0xAA1403E0,  # mov x0, x20
+                    0xAA1603E1,  # mov x1, x22
+                    0xAA1503E2,  # mov x2, x21
+                    0xD0000010,  # adrp x16, #0x2000
+                    0xF9400610,  # ldr x16, [x16, #8]
+                    0xD63F0200,  # blr x16
+                    # Call free(x22) via GOT[2] at +0x2010
+                    0xAA1603E0,  # mov x0, x22
+                    0xD0000010,  # adrp x16, #0x2000
+                    0xF9400A10,  # ldr x16, [x16, #16] (GOT[2] = free)
+                    0xD63F0200,  # blr x16
+                    0xAA1503E0,  # mov x0, x21 (return rl)
+                    0xA9425BF5,  # ldp x21, x22, [sp, #32]
+                    0xA94153F3,  # ldp x19, x20, [sp, #16]
+                    0xA8C37BFD,  # ldp x29, x30, [sp], #48
+                    0xD65F03C0,  # ret
+                    # Reference "OodleLZ_Decompress\0" at +0x1600 so str_fns locates +0x80
+                    0xB0000010,  # adrp x16, #0x1000
+                    0x91180210,  # add x16, x16, #0x600
+                ]
+                real_img = bytearray(0x4000)
+                struct.pack_into('<I', real_img, 4, 0x1000)
+                for idx, w in enumerate(code_words):
+                    struct.pack_into('<I', real_img, 0x80 + idx * 4, w)
+                real_img[0x1000:0x1004] = b'MOD0'
+                struct.pack_into('<i', real_img, 0x1004, 0x40)
+                struct.pack_into('<i', real_img, 0x1010, 0x700)
+                real_img[0x1600:0x1600 + len(s_oodle)] = s_oodle
+                struct.pack_into('<BBBBIIII', real_img, 0x1700, 1, 0x03, 0x03, 0x03, 0, 1, 0x80, 0)
+
+                strs = bytearray(b'\0malloc\0memcpy\0free\0')
+                syms = bytearray(24)
+                syms.extend(struct.pack('<IBBHQQ', 1, 0x10, 0, 0, 0, 0))   # 1: malloc
+                syms.extend(struct.pack('<IBBHQQ', 8, 0x10, 0, 0, 0, 0))   # 2: memcpy
+                syms.extend(struct.pack('<IBBHQQ', 15, 0x10, 0, 0, 0, 0))  # 3: free
+                relas = b''.join([
+                    struct.pack('<QQq', 0x2000, (1 << 32) | 1025, 0),
+                    struct.pack('<QQq', 0x2008, (2 << 32) | 1025, 0),
+                    struct.pack('<QQq', 0x2010, (3 << 32) | 1025, 0),
+                ])
+                real_img[0x1100:0x1100 + len(syms)] = syms
+                real_img[0x1300:0x1300 + len(strs)] = strs
+                real_img[0x1500:0x1500 + len(relas)] = relas
+                for i, (t, v) in enumerate([(6, 0x1100), (5, 0x1300), (7, 0x1500), (8, len(relas)), (0, 0)]):
+                    struct.pack_into('<qQ', real_img, 0x1040 + i * 16, t, v)
+
+                exefs2 = Path(td) / 'real_uc' / 'extract' / 'v0' / 'ExeFS'
+                exefs2.mkdir(parents=True)
+                (exefs2 / 'main').write_bytes(self._make_nso0(real_img, compress=True))
+                patched2 = Path(td) / 'real_uc' / 'patched_v0'
+                patched2.mkdir(parents=True)
+
+                dec_real = OE.Decoder(patched2, use_fast_stubs=True)
+                self.assertEqual(dec_real.off, 0x80)
+                trap_calls = []
+                assert dec_real.m is not None
+                orig_on_trap = dec_real.m._on_trap
+                dec_real.m._on_trap = lambda *a: (trap_calls.append(1), orig_on_trap(*a))[1]
+                payload = b'REAL_UNICORN_FAST_STUBS_ZERO_TRAPS!' * 20
+                out_real = dec_real.run(payload, len(payload))
+                self.assertEqual(out_real, payload)
+                self.assertEqual(len(trap_calls), 0, 'in-VM fast stubs must execute with 0 Python traps')
 
 
 if __name__ == '__main__':
